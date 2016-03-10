@@ -47,8 +47,8 @@
 
 #include "FFmpegExtractor.h"
 
-#define MAX_QUEUE_SIZE (15 * 1024 * 1024)
-#define MIN_AUDIOQ_SIZE (20 * 16 * 1024)
+#define MAX_QUEUE_SIZE (40 * 1024 * 1024)
+#define MIN_AUDIOQ_SIZE (2 * 1024 * 1024)
 #define MIN_FRAMES 5
 #define EXTRACTOR_MAX_PROBE_PACKETS 200
 #define FF_MAX_EXTRADATA_SIZE ((1 << 28) - FF_INPUT_BUFFER_PADDING_SIZE)
@@ -1201,6 +1201,15 @@ void FFmpegExtractor::readerEntry() {
             ALOGV("readerEntry, full(wtf!!!), mVideoQ.size: %d, mVideoQ.nb_packets: %d, mAudioQ.size: %d, mAudioQ.nb_packets: %d",
                     mVideoQ.size, mVideoQ.nb_packets, mAudioQ.size, mAudioQ.nb_packets);
 #endif
+            // avoid deadlock, the audio and video data in the video is offset too large.
+            if ((mAudioQ.size == 0) && mAudioQ.wait_for_data) {
+                ALOGE("abort audio queue, since offset to video data too large");
+                packet_queue_abort(&mAudioQ);
+            }
+            if ((mVideoQ.size == 0) && mVideoQ.wait_for_data) {
+                ALOGE("abort video queue, since offset to audio data too large");
+                packet_queue_abort(&mVideoQ);
+            }
             /* wait 10 ms */
             mExtractorMutex.lock();
             mCondition.waitRelative(mExtractorMutex, milliseconds(10));
@@ -1519,6 +1528,21 @@ retry:
         timeUs = av_rescale_q(pktTS, mStream->time_base, AV_TIME_BASE_Q) - startTimeUs;
     else
         timeUs = SF_NOPTS_VALUE; //FIXME AV_NOPTS_VALUE is negative, but stagefright need positive
+
+    // Negative timestamp will cause crash for media_server
+    // in OMXCodec.cpp CHECK(lastBufferTimeUs >= 0).
+    // And we should not get negative timestamp
+    if (timeUs < 0) {
+        ALOGE("negative timestamp encounter: time: %" PRId64
+               " startTimeUs: %" PRId64
+               " packet dts: %" PRId64
+               " packet pts: %" PRId64
+               , timeUs, startTimeUs, pkt.dts, pkt.pts);
+        mediaBuffer->release();
+        mediaBuffer = NULL;
+        av_free_packet(&pkt);
+        return ERROR_MALFORMED;
+    }
 
     // predict the next PTS to use for exact-frame seek below
     int64_t nextPTS = AV_NOPTS_VALUE;
@@ -2126,6 +2150,9 @@ bool SniffFFMPEG(
     // This is a heavyweight sniffer, don't invoke it if Stagefright knows
     // what it is doing already.
     if (mimeType != NULL && confidence != NULL) {
+        if (*mimeType == "application/ogg") {
+            return false;
+        }
         if (*confidence > 0.8f) {
             return false;
         }
